@@ -295,10 +295,16 @@
 <script>
 const MAX=3;let sessions=[],counter=0;
 
+/* ── Helper: update the visible label span ── */
+function updateLabelUI(s){
+  const p=document.getElementById(s.id);if(!p)return;
+  const lbl=p.querySelector('[data-r="lbl"]');
+  if(lbl&&lbl.tagName!=='INPUT') lbl.textContent=s.name;
+}
+
 function addSession(){
   if(sessions.length>=MAX)return;
   counter++;
-  // No auto-numbering: all new tabs start as "Tab"
   const s={id:'p'+counter,name:'Tab',inputCm:null,outputCm:null,
     view:'input',outMode:'code',parsed:null,
     cmMarks:[],cmMatches:[],cmIdx:-1,
@@ -332,14 +338,13 @@ document.getElementById('addTabBtn').addEventListener('click',addSession);
 function startEditLabel(s){
   const p=document.getElementById(s.id);
   const lbl=p.querySelector('[data-r="lbl"]');
-  if(!lbl||lbl.tagName==='INPUT')return; // already editing
+  if(!lbl||lbl.tagName==='INPUT')return;
   const current=s.name||'Tab';
 
   const inp=document.createElement('input');
   inp.type='text';
   inp.className='panel-label-input';
   inp.value=current;
-  // Size input to fit content
   inp.style.width=Math.max(50,Math.min(220,current.length*9+20))+'px';
   lbl.replaceWith(inp);
   inp.setAttribute('data-r','lbl');
@@ -557,8 +562,10 @@ function reset(s){
   q('errBox').classList.add('hidden');q('inWrap').classList.remove('editor-error');
   q('metaBar').classList.add('hidden');q('stree').innerHTML='';
   clearAllSearch(s);q('searchBar').classList.add('hidden');s.searchOpen=false;s.focusedPath=null;
-  // Preserve the user's custom name on reset; only revert auto-set names
-  if(!s.userRenamed){s.name='Tab';const lbl=q('lbl');if(lbl&&lbl.tagName!=='INPUT')lbl.textContent='Tab';}
+  // Always reset name and userRenamed flag on clear
+  s.name='Tab';
+  s.userRenamed=false;
+  updateLabelUI(s);
   toInput(s);
 }
 async function copyOut(s){
@@ -587,9 +594,14 @@ function parse(s){
     const dp=deepParse(JSON.parse(ue));s.parsed=dp;
     s.outputCm.setValue(JSON.stringify(dp,null,2));
     // Auto-set name from parsed title only if user hasn't manually renamed the tab
-    if(meta.title&&!s.userRenamed){
-      s.name=meta.title.substring(0,40)+(meta.title.length>40?'…':'');
-      const lbl=q('lbl');if(lbl&&lbl.tagName!=='INPUT')lbl.textContent=s.name;
+    if(!s.userRenamed){
+      if(meta.title){
+        s.name=meta.title.substring(0,40)+(meta.title.length>40?'…':'');
+      }else{
+        // No title in this JSON — reset back to default
+        s.name='Tab';
+      }
+      updateLabelUI(s);
       updateLayout();
     }
     toOutput(s);
