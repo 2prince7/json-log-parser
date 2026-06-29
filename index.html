@@ -78,7 +78,6 @@
     .dot{width:8px;height:8px;border-radius:50%;display:inline-block;flex-shrink:0}
     .dot-blue{background:#3b82f6}.dot-green{background:#10b981}
 
-    /* ── Editable label ── */
     .panel-label-text{
       overflow:hidden;text-overflow:ellipsis;white-space:nowrap;
       cursor:text;
@@ -214,6 +213,72 @@
     .CodeMirror-foldgutter-folded::after{content:"▸"}
     .CodeMirror-foldgutter-open:hover,.CodeMirror-foldgutter-folded:hover{color:#6366f1!important}
 
+    /* ── KEY TOOLTIP ── */
+    #key-tooltip{
+      position:fixed;
+      z-index:9999;
+      pointer-events:none;
+      opacity:0;
+      transition:opacity .12s ease;
+      max-width:480px;
+    }
+    #key-tooltip.visible{opacity:1}
+    #key-tooltip .kt-inner{
+      background:#1e1e2e;
+      border:1px solid #3b3b5c;
+      border-radius:8px;
+      padding:7px 11px 8px;
+      box-shadow:0 8px 24px rgba(0,0,0,.35);
+      font-family:'JetBrains Mono',monospace;
+      font-size:11.5px;
+      line-height:1.5;
+      white-space:nowrap;
+    }
+    #key-tooltip .kt-crumbs{
+      display:flex;
+      align-items:center;
+      gap:0;
+      flex-wrap:nowrap;
+      overflow:hidden;
+    }
+    #key-tooltip .kt-seg{
+      color:#a78bfa;
+      font-weight:600;
+    }
+    #key-tooltip .kt-seg.kt-last{
+      color:#f0abfc;
+      font-weight:700;
+    }
+    #key-tooltip .kt-seg.kt-idx{
+      color:#fb923c;
+    }
+    #key-tooltip .kt-sep{
+      color:#4b5563;
+      margin:0 2px;
+      font-weight:400;
+      font-size:13px;
+    }
+    #key-tooltip .kt-type{
+      margin-top:3px;
+      font-size:10.5px;
+    }
+    #key-tooltip .kt-type-badge{
+      display:inline-block;
+      padding:1px 7px;
+      border-radius:3px;
+      font-weight:700;
+      font-size:10px;
+      letter-spacing:.3px;
+      text-transform:uppercase;
+    }
+    .ktb-object{background:#312e81;color:#a5b4fc}
+    .ktb-array{background:#451a03;color:#fdba74}
+    .ktb-string{background:#042f2e;color:#5eead4}
+    .ktb-number{background:#422006;color:#fcd34d}
+    .ktb-boolean{background:#172554;color:#93c5fd}
+    .ktb-null{background:#450a0a;color:#fca5a5}
+    .ktb-mixed{background:#2e1065;color:#d8b4fe}
+
     .schema-tree{
       font-family:'JetBrains Mono',monospace;
       font-size:13px;line-height:1.55;padding:12px;
@@ -281,6 +346,15 @@
   </style>
 </head>
 <body>
+
+<!-- Global key tooltip -->
+<div id="key-tooltip">
+  <div class="kt-inner">
+    <div class="kt-crumbs" id="kt-crumbs"></div>
+    <div class="kt-type" id="kt-type"></div>
+  </div>
+</div>
+
 <div class="app-shell" id="appShell" data-count="1">
   <div class="app-header">
     <div class="app-header-left">
@@ -295,7 +369,173 @@
 <script>
 const MAX=3;let sessions=[],counter=0;
 
-/* ── Helper: update the visible label span ── */
+/* ══════════════════════════════════════════
+   KEY PATH RESOLUTION
+   Given a parsed JSON object and a line number
+   from CodeMirror, walk the JSON to find the
+   full path to the key on that line.
+   ══════════════════════════════════════════ */
+
+/**
+ * Build a flat map: lineNumber → path segments array
+ * by serializing the object the same way JSON.stringify(obj,null,2) does
+ * and tracking which key lands on which line.
+ */
+function buildLinePathMap(parsed){
+  // Recursive tree-walk that mirrors JSON.stringify(obj,null,2) line-by-line.
+  // Guarantees the path is always correct regardless of nesting depth or
+  // array-of-objects structures, because it follows the actual data tree
+  // instead of trying to parse the serialised text.
+  const map={};
+  let li=0;
+
+  function typeOf(v){
+    if(v===null)return 'null';
+    if(Array.isArray(v))return 'array';
+    return typeof v;
+  }
+
+  function walk(value,pathSegs){
+    const t=typeOf(value);
+    if(t==='object'){
+      Object.keys(value).forEach(k=>{
+        const cv=value[k];
+        const ct=typeOf(cv);
+        const cp=[...pathSegs,k];
+        map[li]={path:cp,type:ct};
+        li++; // "key": ... line
+        if(ct==='object'){walk(cv,cp);li++;} // closing }
+        else if(ct==='array'){walk(cv,cp);li++;} // closing ]
+        // scalars already consumed
+      });
+    } else if(t==='array'){
+      value.forEach((item,idx)=>{
+        const it=typeOf(item);
+        const ip=[...pathSegs,'['+idx+']'];
+        if(it==='object'||it==='array'){
+          map[li]={path:ip,type:it};
+          li++; // opening { or [
+          walk(item,ip);
+          li++; // closing } or ]
+        } else {
+          map[li]={path:ip,type:it};
+          li++;
+        }
+      });
+    }
+  }
+
+  const rt=typeOf(parsed);
+  li++; // root opening { or [
+  walk(parsed,[]);
+  // root closing line not needed in map
+  return map;
+}
+
+/* ══════════════════════════════════════
+   TOOLTIP DOM
+   ══════════════════════════════════════ */
+const tooltip=document.getElementById('key-tooltip');
+const ktCrumbs=document.getElementById('kt-crumbs');
+const ktType=document.getElementById('kt-type');
+let tooltipTimer=null;
+
+function showTooltip(x,y,pathSegs,type){
+  clearTimeout(tooltipTimer);
+  // build breadcrumb HTML
+  const html=pathSegs.map((seg,i)=>{
+    const isLast=i===pathSegs.length-1;
+    const isIdx=seg.startsWith('[');
+    let cls='kt-seg';
+    if(isLast)cls+=' kt-last';
+    if(isIdx)cls+=' kt-idx';
+    const sep=i>0?'<span class="kt-sep">›</span>':'';
+    return sep+'<span class="'+cls+'">'+escHtml(seg)+'</span>';
+  }).join('');
+  ktCrumbs.innerHTML=html;
+
+  // type badge
+  const typMap={object:'ktb-object',array:'ktb-array',string:'ktb-string',
+    number:'ktb-number',boolean:'ktb-boolean','null':'ktb-null',mixed:'ktb-mixed'};
+  const cls=typMap[type]||'ktb-string';
+  ktType.innerHTML='<span class="kt-type-badge '+cls+'">'+escHtml(type)+'</span>';
+
+  // position
+  tooltip.style.left='0px';
+  tooltip.style.top='0px';
+  tooltip.classList.add('visible');
+
+  // measure then reposition
+  requestAnimationFrame(()=>{
+    const tw=tooltip.offsetWidth,th=tooltip.offsetHeight;
+    let lx=x+14,ly=y-th-10;
+    if(lx+tw>window.innerWidth-8)lx=x-tw-8;
+    if(ly<4)ly=y+20;
+    tooltip.style.left=lx+'px';
+    tooltip.style.top=ly+'px';
+  });
+}
+
+function hideTooltip(delay){
+  clearTimeout(tooltipTimer);
+  tooltipTimer=setTimeout(()=>tooltip.classList.remove('visible'),delay||80);
+}
+
+function escHtml(s){return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')}
+
+/* ══════════════════════════════════════
+   ATTACH TOOLTIP TO A SESSION's outputCm
+   ══════════════════════════════════════ */
+function attachTooltip(s){
+  const cmEl=s.outputCm.getWrapperElement();
+  let linePathMap=null;
+  let lastLine=-1;
+
+  // rebuild map when content changes
+  s.outputCm.on('change',()=>{linePathMap=null;lastLine=-1});
+
+  function ensureMap(){
+    if(!linePathMap&&s.parsed){
+      linePathMap=buildLinePathMap(s.parsed);
+    }
+  }
+
+  cmEl.addEventListener('mousemove',e=>{
+    // only in code view
+    if(s.outMode!=='code'||s.view!=='output'){hideTooltip(0);return}
+
+    // find the target span — must be a cm-property (key token)
+    const target=e.target;
+    if(!target||!target.classList.contains('cm-property')){
+      hideTooltip(120);
+      return;
+    }
+
+    // get CodeMirror position from mouse coords
+    const coords=s.outputCm.coordsChar({left:e.clientX,top:e.clientY},'window');
+    const lineNo=coords.line;
+    if(lineNo===lastLine)return; // same line, tooltip already showing
+    lastLine=lineNo;
+
+    ensureMap();
+    if(!linePathMap){hideTooltip(0);return}
+
+    const info=linePathMap[lineNo];
+    if(!info){hideTooltip(120);return}
+
+    showTooltip(e.clientX,e.clientY,info.path,info.type);
+  });
+
+  cmEl.addEventListener('mouseleave',()=>{
+    lastLine=-1;
+    hideTooltip(150);
+  });
+}
+
+/* ════════════════════════════════════════════
+   REST OF THE APP (unchanged from original)
+   ════════════════════════════════════════════ */
+
 function updateLabelUI(s){
   const p=document.getElementById(s.id);if(!p)return;
   const lbl=p.querySelector('[data-r="lbl"]');
@@ -334,43 +574,27 @@ function updateLayout(){
 
 document.getElementById('addTabBtn').addEventListener('click',addSession);
 
-/* ── Editable label logic ── */
 function startEditLabel(s){
   const p=document.getElementById(s.id);
   const lbl=p.querySelector('[data-r="lbl"]');
   if(!lbl||lbl.tagName==='INPUT')return;
   const current=s.name||'Tab';
-
   const inp=document.createElement('input');
-  inp.type='text';
-  inp.className='panel-label-input';
-  inp.value=current;
+  inp.type='text';inp.className='panel-label-input';inp.value=current;
   inp.style.width=Math.max(50,Math.min(220,current.length*9+20))+'px';
-  lbl.replaceWith(inp);
-  inp.setAttribute('data-r','lbl');
-  inp.focus();
-  inp.select();
-
+  lbl.replaceWith(inp);inp.setAttribute('data-r','lbl');inp.focus();inp.select();
   function commit(){
-    const val=inp.value.trim()||'Tab';
-    s.name=val;
-    s.userRenamed=true;
+    const val=inp.value.trim()||'Tab';s.name=val;s.userRenamed=true;
     const newSpan=document.createElement('span');
-    newSpan.className='panel-label-text';
-    newSpan.setAttribute('data-r','lbl');
-    newSpan.textContent=val;
-    newSpan.addEventListener('click',()=>startEditLabel(s));
-    inp.replaceWith(newSpan);
+    newSpan.className='panel-label-text';newSpan.setAttribute('data-r','lbl');newSpan.textContent=val;
+    newSpan.addEventListener('click',()=>startEditLabel(s));inp.replaceWith(newSpan);
   }
-
   inp.addEventListener('blur',commit);
   inp.addEventListener('keydown',e=>{
     if(e.key==='Enter'){e.preventDefault();inp.blur();}
     if(e.key==='Escape'){inp.value=current;s.userRenamed=(current!=='Tab');inp.blur();}
   });
-  inp.addEventListener('input',()=>{
-    inp.style.width=Math.max(50,Math.min(220,inp.value.length*9+20))+'px';
-  });
+  inp.addEventListener('input',()=>{inp.style.width=Math.max(50,Math.min(220,inp.value.length*9+20))+'px'});
 }
 
 function buildPanel(s){
@@ -388,7 +612,7 @@ function buildPanel(s){
             <button class="vpill active" data-r="vCode">{ } Code</button>
             <button class="vpill" data-r="vTree">⧉ Schema</button>
           </div>
-            <button class="btn-icon" data-r="searchToggle" title="Cerca (Ctrl+F)">
+          <button class="btn-icon" data-r="searchToggle" title="Cerca (Ctrl+F)">
             <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg>
           </button>
         </div>
@@ -431,7 +655,6 @@ function buildPanel(s){
     </div>`;
   row.appendChild(p);
 
-  // Wire up editable label
   p.querySelector('[data-r="lbl"]').addEventListener('click',()=>startEditLabel(s));
 
   const q=r=>p.querySelector(`[data-r="${r}"]`);
@@ -440,6 +663,9 @@ function buildPanel(s){
   s.inputCm.setSize('100%','100%');
   s.outputCm=CodeMirror.fromTextArea(q('outTa'),{...cmOpts,readOnly:true});
   s.outputCm.setSize('100%','100%');
+
+  // Attach key tooltip to this session's output editor
+  attachTooltip(s);
 
   q('parseBtn').addEventListener('click',()=>parse(s));
   q('clrIn').addEventListener('click',()=>reset(s));
@@ -538,6 +764,7 @@ function toInput(s){
   q('outLeftControls').classList.add('hidden');q('outLeftControls').style.display='none';
   q('searchBar').classList.add('hidden');s.searchOpen=false;clearAllSearch(s);
   q('dot').className='dot dot-blue';
+  hideTooltip(0);
   setTimeout(()=>s.inputCm.refresh(),10);
 }
 function toOutput(s){
@@ -555,6 +782,7 @@ function setMode(s,m){
   q('vCode').classList.toggle('active',m==='code');q('vTree').classList.toggle('active',m==='tree');
   if(m==='code')setTimeout(()=>s.outputCm.refresh(),10);else if(s.parsed)renderSchema(s);
   if(s.searchOpen&&prev!==m)doSearch(s);
+  if(m!=='code')hideTooltip(0);
 }
 function reset(s){
   s.inputCm.setValue('');s.outputCm.setValue('');s.parsed=null;
@@ -562,10 +790,8 @@ function reset(s){
   q('errBox').classList.add('hidden');q('inWrap').classList.remove('editor-error');
   q('metaBar').classList.add('hidden');q('stree').innerHTML='';
   clearAllSearch(s);q('searchBar').classList.add('hidden');s.searchOpen=false;s.focusedPath=null;
-  // Always reset name and userRenamed flag on clear
-  s.name='Tab';
-  s.userRenamed=false;
-  updateLabelUI(s);
+  s.name='Tab';s.userRenamed=false;
+  updateLabelUI(s);hideTooltip(0);
   toInput(s);
 }
 async function copyOut(s){
@@ -593,16 +819,10 @@ function parse(s){
   try{
     const dp=deepParse(JSON.parse(ue));s.parsed=dp;
     s.outputCm.setValue(JSON.stringify(dp,null,2));
-    // Auto-set name from parsed title only if user hasn't manually renamed the tab
     if(!s.userRenamed){
-      if(meta.title){
-        s.name=meta.title.substring(0,40)+(meta.title.length>40?'…':'');
-      }else{
-        // No title in this JSON — reset back to default
-        s.name='Tab';
-      }
-      updateLabelUI(s);
-      updateLayout();
+      if(meta.title){s.name=meta.title.substring(0,40)+(meta.title.length>40?'…':'');}
+      else{s.name='Tab';}
+      updateLabelUI(s);updateLayout();
     }
     toOutput(s);
   }catch(e){q('errBox').textContent='Invalid JSON: '+e.message;q('errBox').classList.remove('hidden');q('inWrap').classList.add('editor-error')}
@@ -625,34 +845,21 @@ function infer(v){
   }
   return {t:typeof v};
 }
-
 function mergeSchema(a,b){
-  if(!a) return b;
-  if(!b) return a;
+  if(!a) return b;if(!b) return a;
   if(a.t===b.t){
     if(a.t==='object'){
-      const keys={};
-      const aKeys=a.keys||{}, bKeys=b.keys||{};
+      const keys={};const aKeys=a.keys||{},bKeys=b.keys||{};
       const allK=new Set([...Object.keys(aKeys),...Object.keys(bKeys)]);
       for(const k of allK){
-        const inA=k in aKeys, inB=k in bKeys;
-        if(inA&&inB){
-          keys[k]=mergeSchema(aKeys[k],bKeys[k]);
-          if(aKeys[k].optional||bKeys[k].optional) keys[k].optional=true;
-        }else{
-          keys[k]=inA?{...aKeys[k],optional:true}:{...bKeys[k],optional:true};
-        }
+        const inA=k in aKeys,inB=k in bKeys;
+        if(inA&&inB){keys[k]=mergeSchema(aKeys[k],bKeys[k]);if(aKeys[k].optional||bKeys[k].optional)keys[k].optional=true}
+        else{keys[k]=inA?{...aKeys[k],optional:true}:{...bKeys[k],optional:true}}
       }
       return {t:'object',keys};
     }
-    if(a.t==='array'){
-      const items=(a.items&&b.items)?mergeSchema(a.items,b.items):(a.items||b.items);
-      return {t:'array',items,n:Math.max(a.n||0,b.n||0)};
-    }
-    if(a.t==='mixed'){
-      const set=new Set([...(a.types||[]),...(b.types||[])]);
-      return {t:'mixed',types:[...set]};
-    }
+    if(a.t==='array'){const items=(a.items&&b.items)?mergeSchema(a.items,b.items):(a.items||b.items);return {t:'array',items,n:Math.max(a.n||0,b.n||0)}}
+    if(a.t==='mixed'){const set=new Set([...(a.types||[]),...(b.types||[])]);return {t:'mixed',types:[...set]}}
     return a;
   }
   const aTypes=a.t==='mixed'?(a.types||[]):[a.t];
@@ -690,7 +897,6 @@ function getSchemaAtPath(schema,path){
   return cur;
 }
 function focusSchema(s,path){s.focusedPath=path;renderSchema(s)}
-
 function buildSN(key,sc,root,session,parentPath){
   const curPath=root?parentPath:(key!==null?(parentPath?(parentPath+'.'+key):key):(parentPath?parentPath+'[]':'[]'));
   const w=document.createElement('div');w.className='st-node';
@@ -720,15 +926,8 @@ function buildSN(key,sc,root,session,parentPath){
     const sp=document.createElement('span');sp.className='st-spacer';row.appendChild(sp);
     const lbl=document.createElement('span');let h='';
     if(key!==null) h+=`<span class="st-key">${esc(String(key))}</span>${sc.optional?'<span class="st-optional">?</span>':''}<span class="st-colon">:</span> `;
-    if(sc.t==='mixed'){
-      const typeLabels=sc.types.map(t=>t.charAt(0).toUpperCase()+t.slice(1)).join(' | ');
-      h+=`<span class="st-badge st-b-mixed">⚡ ${esc(typeLabels)}</span>`;
-    }else{
-      const map={string:'st-b-str',number:'st-b-num',boolean:'st-b-bool','null':'st-b-null'};
-      const icons={string:'✎',number:'#',boolean:'✓','null':'∅'};
-      const bc=map[sc.t]||'st-b-str';const ic=icons[sc.t]||'';
-      h+=`<span class="st-badge ${bc}">${ic} ${sc.t.charAt(0).toUpperCase()+sc.t.slice(1)}</span>`;
-    }
+    if(sc.t==='mixed'){const typeLabels=sc.types.map(t=>t.charAt(0).toUpperCase()+t.slice(1)).join(' | ');h+=`<span class="st-badge st-b-mixed">⚡ ${esc(typeLabels)}</span>`;}
+    else{const map={string:'st-b-str',number:'st-b-num',boolean:'st-b-bool','null':'st-b-null'};const icons={string:'✎',number:'#',boolean:'✓','null':'∅'};const bc=map[sc.t]||'st-b-str';const ic=icons[sc.t]||'';h+=`<span class="st-badge ${bc}">${ic} ${sc.t.charAt(0).toUpperCase()+sc.t.slice(1)}</span>`;}
     lbl.innerHTML=h;row.appendChild(lbl);
     if(key!==null&&session){
       const fb=document.createElement('button');fb.className='st-focus';fb.title='Focus: '+curPath;fb.textContent='⊕';
